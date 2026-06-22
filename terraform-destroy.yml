@@ -1,0 +1,109 @@
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        type: choice
+        description: "Branch name to checkout"
+        required: true
+        default: "main"
+        options:
+          - main
+          - feature1
+          - feat/Infra
+      environment:
+        type: choice
+        description: "Environment name"
+        required: true
+        default: "DEV"
+        options:
+          - DEV
+          - QA
+          - PRD
+          - HUB
+      subscription:
+        type: choice
+        description: "Subscription name"
+        required: true
+        default: "QA"
+        options:
+          - QA
+          - PRD
+          - HUB
+      runner:
+        type: choice
+        description: "Runner label (Auto maps by environment)"
+        required: true
+        default: "Auto"
+        options:
+          - Auto
+          - Dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform:
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - azure
+      - ${{ github.event.inputs.runner != 'Auto' && github.event.inputs.runner || contains(fromJson('["PRD","HUB"]'), github.event.inputs.environment) && 'prod' || 'Dev' }}
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Validate Environment and Subscription
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ github.event.inputs.environment }}" in
+            PRD) expected="PRD" ;;
+            HUB) expected="HUB" ;;
+            DEV|QA) expected="QA" ;;
+            *)
+              echo "::error::Unsupported environment: ${{ github.event.inputs.environment }}"
+              exit 1
+              ;;
+          esac
+
+          if [ "${{ github.event.inputs.subscription }}" != "$expected" ]; then
+            echo "::error::Invalid selection: environment '${{ github.event.inputs.environment }}' must use subscription '$expected'."
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapper: false
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ github.event.inputs.subscription == 'PRD' && secrets.AZURE_CLIENT_ID_PRD || github.event.inputs.subscription == 'HUB' && secrets.AZURE_CLIENT_ID_HUB || secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ github.event.inputs.subscription == 'PRD' && secrets.AZURE_TENANT_ID_PRD || github.event.inputs.subscription == 'HUB' && secrets.AZURE_TENANT_ID_HUB || secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ github.event.inputs.subscription == 'PRD' && secrets.AZURE_SUBSCRIPTION_ID_PRD || github.event.inputs.subscription == 'HUB' && secrets.AZURE_SUBSCRIPTION_ID_HUB || secrets.AZURE_SUBSCRIPTION_ID_QA }}
+          enable-AzPSSession: false
+      - name: Terraform Init
+        run: terraform init
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+
+      - name: Terraform Plan Destroy
+        run: terraform plan -destroy -var-file=terraform.tfvars -out=tfdestroyplan
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+
+      - name: Approval Gate
+        if: github.event.inputs.subscription == 'PRD'
+        run: |
+          echo "PRD destroy pending approval"
+          echo "Plan generated at: terraform/environments/${{ github.event.inputs.environment }}/tfdestroyplan"
+
+      - name: Terraform Destroy
+        run: terraform apply tfdestroyplan
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
